@@ -1,0 +1,22 @@
+[package]
+name = "uta"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.75"
+clap = { version = "4.3.23", features = ["derive", "cargo"] }
+regex = "1.9.3"
+reqwest = { version = "0.11.19", features = ["json", "brotli", "gzip", "deflate", "socks"] }
+serde = { version = "1.0.185", features = ["derive"] }
+serde_json = "1.0.105"
+serde_urlencoded = "0.7.1"
+tokio = { version = "1.32.0", features = ["full"] }
+xmlem = "0.2.3"
+
+[profile.release]
+opt-level = 3
+strip = "symbols"
+lto = "fat"
