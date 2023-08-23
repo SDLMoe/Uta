@@ -126,20 +126,18 @@ impl Uta {
                 "{}/{} - {}.ttml",
                 folder_name, track.attributes.name, track.attributes.artist_name
             );
-            let mut file = std::fs::File::create(&file_name).context("Failed to create file")?;
-            file.write_all(
-                nice_xml(
-                    lyrics
-                        .data
-                        .get(0)
-                        .context("No lyrics found")?
-                        .attributes
-                        .ttml
-                        .clone(),
-                )
-                .as_bytes(),
-            )
-            .context("Failed to write file")?;
+            let track_lyric = lyrics.data.get(0);
+            if let Some(lyric) = track_lyric {
+                let mut file =
+                    std::fs::File::create(&file_name).context("Failed to create file")?;
+                file.write_all(nice_xml(lyric.attributes.ttml.clone()).as_bytes())
+                    .context("Failed to write file")?;
+            } else {
+                println!(
+                    "{} - {} has no lyrics",
+                    track.attributes.name, track.attributes.artist_name
+                );
+            }
         }
 
         Ok(())
@@ -168,21 +166,17 @@ impl Uta {
 
         println!("Saving lyrics...");
 
-        let file_name = format!("{} - {}.ttml", attributes.name, attributes.artist_name);
-        let mut file = std::fs::File::create(file_name).context("Failed to create file")?;
-        file.write_all(
-            nice_xml(
-                lyrics
-                    .data
-                    .get(0)
-                    .context("No lyrics found")?
-                    .attributes
-                    .ttml
-                    .clone(),
-            )
-            .as_bytes(),
-        )
-        .context("Failed to write file")?;
+        let lyric = lyrics.data.get(0);
+
+        if let Some(lyric) = lyric {
+            let file_name = format!("{} - {}.ttml", attributes.name, attributes.artist_name);
+            let mut file = std::fs::File::create(file_name).context("Failed to create file")?;
+            file.write_all(nice_xml(lyric.attributes.ttml.clone()).as_bytes())
+                .context("Failed to write file")?;
+        } else {
+            println!("This song has no lyrics");
+        }
+
         Ok(())
     }
 
