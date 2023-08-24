@@ -1,14 +1,17 @@
 mod types;
 
 use crate::types::{AlbumCatlogs, SongCatlogs, Storefronts};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use reqwest::{header, Client, Error, Response, Url};
 use std::io::Write;
 use std::str::FromStr;
 use xmlem::display::Config;
-use xmlem::Document;
+use xmlem::{Document, Selector};
 
-use clap::Parser;
+use clap::{ArgGroup, Parser};
+use lrc::{IDTag, Lyrics, TimeTag};
+use once_cell::sync::Lazy;
+use regex::Regex;
 
 pub fn nice_xml(xml: String) -> String {
     Document::from_str(&xml)
@@ -23,6 +26,90 @@ pub fn nice_xml(xml: String) -> String {
         })
 }
 
+static TTML_TIMETAG_HMS: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^((?P<hour>\d+):)?((?P<minute>\d{1,2}):)?(?P<second>\d{1,2})\.(?P<frames>\d{3})$")
+        .unwrap()
+});
+
+static TTML_TIMETAG_MS: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"^((?P<minute>\d{1,2}):)?(?P<second>\d{1,2})\.(?P<frames>\d{3})$").unwrap()
+});
+
+pub fn ttml_timetag_to_lrc_timetag(ttml: &str) -> Result<TimeTag> {
+    if let Some(ms) = TTML_TIMETAG_MS.captures(ttml) {
+        let min: u32 = ms
+            .name("minute")
+            .map(|x| x.as_str().parse().unwrap())
+            .unwrap_or(0);
+        let sec: u32 = ms.name("second").unwrap().as_str().parse().unwrap();
+        let ms: u32 = ms.name("frames").unwrap().as_str().parse().unwrap();
+
+        let ts = format!("{:02}:{:02}.{}", min, sec, ms / 10);
+
+        return TimeTag::from_str(ts).context("Failed to parse lrc timetag");
+    }
+
+    if let Some(hms) = TTML_TIMETAG_HMS.captures(ttml) {
+        let hour: u32 = hms
+            .name("hour")
+            .map(|x| x.as_str().parse().unwrap())
+            .unwrap_or(0);
+        let min: u32 = hms
+            .name("minute")
+            .map(|x| x.as_str().parse().unwrap())
+            .unwrap_or(0);
+        let sec: u32 = hms.name("second").unwrap().as_str().parse().unwrap();
+        let ms: u32 = hms.name("frames").unwrap().as_str().parse().unwrap();
+
+        let ts = format!("{:02}:{:02}.{}", hour * 60 + min, sec, ms / 10);
+
+        return TimeTag::from_str(ts).context("Failed to parse lrc timetag");
+    }
+
+    Err(anyhow!("Invalid pattern"))
+}
+
+pub fn ttml_to_lrc(xml: Document, author: &str, name: &str) -> Result<Lyrics> {
+    let body = xml
+        .root()
+        .query_selector(&xml, &Selector::new("body").unwrap())
+        .unwrap();
+
+    let mut lyrics = Lyrics::new();
+    let metadata = &mut lyrics.metadata;
+
+    metadata.insert(IDTag::from_string("ar", author)?);
+    metadata.insert(IDTag::from_string("ti", name)?);
+
+    for div_element in body.query_selector_all(&xml, &Selector::new("div").unwrap()) {
+        for p_element in div_element.query_selector_all(&xml, &Selector::new("p").unwrap()) {
+            if p_element
+                .query_selector(&xml, &Selector::new("span").unwrap())
+                .is_some()
+            {
+                bail!("Syllable lyrics is not supported");
+            }
+
+            let Some(begin) = p_element.attribute(&xml, "begin") else {
+                bail!("No begin attribute")
+            };
+
+            let text = p_element
+                .child_nodes(&xml)
+                .first()
+                .unwrap()
+                .as_text()
+                .unwrap()
+                .as_str(&xml);
+            let timetag = ttml_timetag_to_lrc_timetag(begin)?;
+
+            lyrics.add_timed_line(timetag, text.to_string()).unwrap();
+        }
+    }
+
+    Ok(lyrics)
+}
+
 struct Uta {
     client: Client,
     token: String,
@@ -33,17 +120,27 @@ struct Uta {
 
 #[derive(Parser)]
 #[clap(version, name = "uta")]
+#[clap(group(
+    ArgGroup::new("conv")
+        .args(&["syllable", "lrc"])
+))]
 struct Options {
     /// URL of the song or album
     #[arg(short = 'u', long = "url")]
     url: String,
     /// Need syllable lyrics
-    #[arg(short = 's', long = "syllable")]
+    #[arg(short = 's', long = "syllable", default_value_t = false)]
     syllable: bool,
+    /// Convert to lrc
+    #[arg(short = 'l', long = "lrc", default_value_t = false)]
+    lrc: bool,
+    /// Apple media token
+    #[arg(short = 't', long = "token", env = "APPLE_MEDIA_TOKEN")]
+    token: String,
 }
 
 impl Uta {
-    async fn handle_raw_url(&self, url: String, syllable: bool) -> Result<()> {
+    async fn handle_raw_url(&self, url: String, syllable: bool, lrc: bool) -> Result<()> {
         let parsed = Url::parse(&url).context("Failed to parse url")?;
 
         let pairs = parsed.query_pairs();
@@ -54,21 +151,24 @@ impl Uta {
                 .context("Failed to get path segments")?
                 .last()
                 .context("No path segments")?;
-            self.save_album_lyrics(id.to_string(), syllable).await?;
+            self.save_album_lyrics(id.to_string(), syllable, lrc)
+                .await?;
             return Ok(());
         }
 
         let id = parsed.query_pairs().find(|(key, _)| key == "i");
 
         if let Some(id) = id {
-            self.save_song_lyrics(id.1.to_string(), syllable).await?;
+            self.save_song_lyrics(id.1.to_string(), syllable, lrc)
+                .await?;
         } else {
             let id = parsed
                 .path_segments()
                 .context("Failed to get path segments")?
                 .last()
                 .context("No path segments")?;
-            self.save_album_lyrics(id.to_string(), syllable).await?;
+            self.save_album_lyrics(id.to_string(), syllable, lrc)
+                .await?;
         }
 
         Ok(())
@@ -94,7 +194,7 @@ impl Uta {
             .await
     }
 
-    async fn save_album_lyrics(&self, album_id: String, syllable: bool) -> Result<()> {
+    async fn save_album_lyrics(&self, album_id: String, syllable: bool, lrc: bool) -> Result<()> {
         println!("Getting album info...");
 
         let url = format!(
@@ -123,14 +223,25 @@ impl Uta {
         for track in tracks {
             let lyrics = track.relationships.get_lyrics(syllable);
             let file_name = format!(
-                "{}/{} - {}.ttml",
-                folder_name, track.attributes.name, track.attributes.artist_name
+                "{}/{} - {}.{}",
+                folder_name,
+                track.attributes.name,
+                track.attributes.artist_name,
+                if lrc { "lrc" } else { "ttml" }
             );
             let track_lyric = lyrics.data.get(0);
             if let Some(lyric) = track_lyric {
-                let mut file =
-                    std::fs::File::create(&file_name).context("Failed to create file")?;
-                file.write_all(nice_xml(lyric.attributes.ttml.clone()).as_bytes())
+                let buf = if lrc {
+                    let xml = Document::from_str(&lyric.attributes.ttml.clone())
+                        .expect("Failed to parse xml");
+                    ttml_to_lrc(xml, &track.attributes.artist_name, &track.attributes.name)
+                        .context("Failed to convert")?
+                        .to_string()
+                } else {
+                    nice_xml(lyric.attributes.ttml.clone())
+                };
+                let mut file = std::fs::File::create(file_name).context("Failed to create file")?;
+                file.write_all(buf.as_bytes())
                     .context("Failed to write file")?;
             } else {
                 println!(
@@ -143,7 +254,7 @@ impl Uta {
         Ok(())
     }
 
-    async fn save_song_lyrics(&self, song_id: String, syllable: bool) -> Result<()> {
+    async fn save_song_lyrics(&self, song_id: String, syllable: bool, lrc: bool) -> Result<()> {
         println!("Getting song info...");
 
         let url = format!(
@@ -169,9 +280,25 @@ impl Uta {
         let lyric = lyrics.data.get(0);
 
         if let Some(lyric) = lyric {
-            let file_name = format!("{} - {}.ttml", attributes.name, attributes.artist_name);
+            let file_name = format!(
+                "{} - {}.{}",
+                attributes.name,
+                attributes.artist_name,
+                if lrc { "lrc" } else { "ttml" }
+            );
+
+            let buf = if lrc {
+                let xml = Document::from_str(&lyric.attributes.ttml.clone())
+                    .expect("Failed to parse xml");
+                ttml_to_lrc(xml, &attributes.artist_name, &attributes.name)
+                    .context("Failed to convert")?
+                    .to_string()
+            } else {
+                nice_xml(lyric.attributes.ttml.clone())
+            };
+
             let mut file = std::fs::File::create(file_name).context("Failed to create file")?;
-            file.write_all(nice_xml(lyric.attributes.ttml.clone()).as_bytes())
+            file.write_all(buf.as_bytes())
                 .context("Failed to write file")?;
         } else {
             println!("This song has no lyrics");
@@ -226,8 +353,7 @@ impl Uta {
             .context("Failed to send request to Apple Music")?;
 
         let main_page_code = main_page.text().await?;
-        let js_search_re =
-            regex::Regex::new(r#"index(.*?)\.js"#).context("Failed to compile regex")?;
+        let js_search_re = Regex::new(r"index(.*?)\.js").context("Failed to compile regex")?;
         let js_search = js_search_re
             .captures(&main_page_code)
             .context("Failed to find js file")?;
@@ -245,7 +371,7 @@ impl Uta {
 
         let js_file_code = js_file_page.text().await?;
         let jwt_search_re =
-            regex::Regex::new(r#""(?P<key>eyJh(.*?))""#).context("Failed to compile regex")?;
+            Regex::new(r#""(?P<key>eyJh(.*?))""#).context("Failed to compile regex")?;
         let jwt_search = jwt_search_re
             .captures(&js_file_code)
             .context("Failed to find jwt")?;
@@ -278,11 +404,11 @@ impl Uta {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<()> {
     let args: Options = Options::parse();
-    let meta = std::env::var("APPLE_META_TOKEN").expect("APPLE_META_TOKEN is not set");
-    let uta = Uta::new(meta).await;
-    if let Ok(uta) = uta {
-        uta.handle_raw_url(args.url, args.syllable).await.unwrap();
-    }
+    let uta = Uta::new(args.token).await?;
+    uta.handle_raw_url(args.url, args.syllable, args.lrc)
+        .await
+        .context("Failed to handle url")?;
+    Ok(())
 }
